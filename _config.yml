@@ -1,8 +1,23 @@
 # Document:
 # http://simiki.org/docs/configuration.html
 
-url: 
-title: 
-keywords: 
-description: 
-author: 
+url: http://cstarc.github.io
+title: MyWiki
+keywords: wiki
+description:  use for wiki
+author: 紫无之紫
+
+root: /
+source: content
+destination: output
+themes_dir: themes
+theme: cod
+
+default_ext: md
+pygments: true
+debug: false
+
+deploy:
+  - type: git
+    remote: origin
+    branch: gh-pages
