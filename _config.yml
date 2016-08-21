@@ -5,17 +5,39 @@
 # For technical reasons, this file is *NOT* reloaded automatically when you use
 # 'jekyll serve'. If you change this file, please restart the server process.
 
-# Site settings
-title: Your awesome title
-email: your-email@domain.com
-description: > # this means to ignore newlines until "baseurl:"
-  Write an awesome description for your new site here. You can edit this
-  line in _config.yml. It will appear in your document head meta (for
-  Google search results) and in your feed.xml site description.
-baseurl: "" # the subpath of your site, e.g. /blog
-url: "http://yourdomain.com" # the base hostname & protocol for your site
-twitter_username: jekyllrb
-github_username:  jekyll
-
-# Build settings
+permalink: /:year/:month/:day/:title.html
 markdown: kramdown
+highlighter: rouge
+
+kramdown:
+  input: GFM
+
+filter: 'category'
+# author information
+author:
+  name: 紫无之紫
+  email: 15381158111@163.com
+  github: https://github.com/cstarc
+
+  
+# Site settings
+title: 紫无之紫的博客  
+description: > # this means to ignore newlines until "baseurl:"
+    记录学习经历
+    
+baseurl: "" # the subpath of your site, e.g. /blog
+url: "http://cstar.github.io" # the base hostname & protocol for your site
+
+github_username:  cstar
+
+
+
+
+# avatar头像及Favicon
+avatar: /assets/images/me.jpg
+favicon: /assets/img/me.ico
+
+sass:
+  style: compressed
+gems:
+  - jekyll-sitemap
