@@ -1,0 +1,462 @@
+---
+layout: post
+title: 深入剖析 linux GCC 4.4 的 STL string
+category: c plus plus
+---
+
+
+<html>
+<head>
+  <title>深入剖析 linux GCC 4.4 的 STL string</title>
+  <basefont face="微软雅黑" size="2" />
+  <meta http-equiv="Content-Type" content="text/html;charset=utf-8" />
+  <meta name="exporter-version" content="Evernote Windows/276742; Windows/10.0.10586 (Win64);"/>
+  <style>
+    body, td {
+      font-family: 微软雅黑;
+      font-size: 10pt;
+    }
+  </style>
+</head>
+<body>
+<a name="1138"/>
+<h1>深入剖析 linux GCC 4.4 的 STL string</h1>
+
+<div>
+<span><div style="position:relative;"><div style="margin-bottom:54px;">
+		
+	<div style="padding-bottom:9px;margin-top:20px;margin-bottom:30px;border-bottom-width:1px;border-bottom-style:solid;border-bottom-color:rgb(238, 238, 238);word-wrap:break-word;">
+		<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">深入剖析 linux GCC 4.4 的 STL string</h1>		<div><span>Posted on </span><a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/" rel="bookmark" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="下午 5:43"><div>2012 年 11 月 26 日</div></a><span> <span> by </span> <span><a href="http://blogs.360.cn/360cloud/author/zieckey/" rel="author" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="View all posts by zieckey">zieckey</a></span></span>		<span> | </span>
+		<span>
+			<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/#comments" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;"><strong>21</strong> Replies</a>		</span>
+		</div>
+	</div>
+
+	<div style="margin-bottom:18px;word-wrap:break-word;">
+		<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">本文通过研究STL源码来剖析C++中标准模板块库std::string运行机理，重点研究了其中的引用计数和Copy-On-Write技术。</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">平台：x86_64-redhat-linux<div></div>
+gcc version 4.4.6 20110731 (Red Hat 4.4.6-3) (GCC)</p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">1. 问题提出</h1>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">最近在我们的项目当中，出现了两次与使用string相关的问题。</p>
+<h2 style="font-size:31.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">1.1. 问题1：新代码引入的Bug</h2>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">前一段时间有一个老项目来一个新需求，我们新增了一些代码逻辑来处理这个新需求。测试阶段没有问题，但上线之后，偶尔会引起错误的逻辑输出甚至崩溃。这个问题困扰着我们很久。我们对新增代码做周详单元测试和集成测试都没有发现问题，最后只能逼迫我们去看那一大段未修改过原始代码逻辑。该项目中经常会碰到使用string，原始代码中有这样一段逻辑引起了我们的怀疑：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">     string string_info;
+     //... 对string_info的赋值操作
+     char* p = (char*)string_info.data();</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">在严格的检查下和逻辑判断后，某些逻辑分支会对p指向的内容进行一些修改。这样虽然危险，但一直工作正常。联想到我们最近的修改：将string_info这个string对象拷贝了一份，然后进行一些处理。我们意识到string的Copy-On-Write和引用计数技术可能会导致我们拷贝的这个string并没有真正的实现数据拷贝。在做了一些测试和研究之后，我们确信了这一点。如是对上述代码进行了修正处理如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">char* p = &amp;(string_info[0]);</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">然后对项目类似的地方都做了这样的处理之后，测试，上线，一切OK，太完美了。</p>
+<h2 style="font-size:31.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">1.2. 问题2：性能优化</h2>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">最近做一个项目的重构，对相关代码进行性能分析profile时发现memcpy的CPU占比比较高，达到8.7%，仔细检查代码中，发现现有代码大量的map查找操作。map定义如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">     typedef std::map ssmap;
+     ssmap info_map;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">查找的操作如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">     info_map[&quot;some_key&quot;] = some_value;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">我们不经意间就会写出上述代码，如果改为下述代码，性能会好很多：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">     static const std::string __s_some_key   = &quot;some_key&quot;;
+     info_map[__s_some_key] = some_value;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">这是因为第一种代码，每次查找都构造一个临时的string对象，同时会将“some_key”这个字符串拷贝一份。修改之后的代码，只需要在第一次初始化时候构造一次，以后每次调用都不会进行拷贝，因此效率上要好很多。类似代码都经过这样优化之后，memcpy的CPU占比下来了，降到4.3%。</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">下面我们通过深入string的源码内部来解释上述两个问题的解决过程和思路。</p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">2. std::string定义</h1>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">STL中的字符串类string的定义如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">template&lt;typename _CharT, typename _Traits , typename _Alloc&gt; class basic_string;
+typedef basic_string &lt;char, char_traits&lt;char &gt;, allocator&lt; char&gt; &gt; string;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">不难发现string在栈内存空间上只占用一个指针(_CharT* _M_p)的大小空间，因此sizeof(string)==8。其他信息都存储在堆内存空间上。</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><strong>问题1：</strong><div></div>
+我们有下面这一条C++语句：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">string name;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">请问，name这个变量总共带来多大的内存开销？这个问题我们稍后解答。</p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">3. std::string内存空间布局</h1>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">下面我们通过常见的用法来剖析一下string对象内部内存空间布局情况。<div></div>
+最常见的string用法是通过c风格字符串构造一个string对象，例如：<div></div>
+string name(“zieckey”);</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">其调用的构造函数定义如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">basic_string(const _CharT* __s, const _Alloc&amp; __a)
+: _M_dataplus( _S_construct(__s , __s ? __s + traits_type ::length( __s) :
+              __s + npos , __a), __a)
+{}</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">该构造函数直接调用 _S_construct 来构造这个对象，定义如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">template&lt;typename _CharT, typename _Traits , typename _Alloc&gt;
+template&lt;typename _InIterator&gt;
+_CharT*
+basic_string&lt;_CharT , _Traits, _Alloc&gt;::
+_S_construct(_InIterator __beg, _InIterator __end , const _Alloc&amp; __a ,
+             input_iterator_tag)
+{
+    // Avoid reallocation for common case.
+    _CharT __buf[128];
+    size_type __len = 0;
+    while ( __beg != __end &amp;&amp; __len &lt; sizeof(__buf ) / sizeof( _CharT))
+    {
+        __buf[__len ++] = *__beg;
+        ++ __beg;
+    }
+
+    //构造一个 _Rep 结构体，同时分配足够的空间，具体见下面内存映像图示
+    _Rep* __r = _Rep ::_S_create( __len, size_type (0), __a);
+
+    //拷贝数据到 string对象内部
+    _M_copy( __r-&gt;_M_refdata (), __buf, __len);
+    __try
+    {
+        while (__beg != __end)
+        {
+            if (__len == __r-&gt; _M_capacity)
+            {
+                // Allocate more space.
+                _Rep* __another = _Rep:: _S_create(__len + 1, __len, __a);
+                _M_copy(__another -&gt;_M_refdata(), __r-&gt;_M_refdata (), __len);
+                __r-&gt;_M_destroy (__a);
+                __r = __another ;
+            }
+            __r-&gt;_M_refdata ()[__len++] = * __beg;
+            ++ __beg;
+        }
+    }
+    __catch(...)
+    {
+        __r-&gt;_M_destroy (__a);
+        __throw_exception_again;
+    }
+    //设置字符串长度、引用计数以及赋值最后一个字节为结尾符 char_type()
+    __r-&gt; _M_set_length_and_sharable(__len );
+
+    //最后，返回字符串第一个字符的地址
+    return __r-&gt;_M_refdata ();
+}
+
+template&lt;typename _CharT, typename _Traits , typename _Alloc&gt;
+typename basic_string &lt;_CharT, _Traits, _Alloc &gt;::_Rep*
+basic_string&lt;_CharT , _Traits, _Alloc&gt;::_Rep ::
+_S_create(size_type __capacity, size_type __old_capacity ,
+          const _Alloc &amp; __alloc)
+{
+    // 需要分配的空间包括：
+    //  一个数组 char_type[__capacity]
+    //  一个额外的结尾符 char_type()
+    //  一个足以容纳 struct _Rep 空间
+    // Whew. Seemingly so needy, yet so elemental.
+    size_type __size = (__capacity + 1) * sizeof( _CharT) + sizeof (_Rep);
+
+    void* __place = _Raw_bytes_alloc (__alloc). allocate(__size ); //申请空间
+
+    _Rep * __p = new (__place) _Rep;// 在地址__place 空间上直接 new对象( 称为placement new)
+    __p-&gt; _M_capacity = __capacity ;
+    __p-&gt; _M_set_sharable();// 设置引用计数为0，标明该对象只为自己所有
+    return __p;
+}</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">_Rep定义如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">struct _Rep_base
+{
+    size_type               _M_length;
+    size_type               _M_capacity;
+    _Atomic_word            _M_refcount;
+};</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">至此，我们可以回答上面“问题1”中提出的问题：<div></div>
+上文中”string name;”这个name对象所占用的总空间为33个字节，具体如下：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">sizeof(std::string) + 0 + sizeof('') + sizeof(std::string::_Rep)</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">其中：sizeof(std::string)为栈空间</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上文中的提到的另一条C++语句 string name(“zieckey”); 定义了一个string变量name，其内存空间布局如下：</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><a href="http://blogs.360.cn/360cloud/files/2012/11/string-1.png" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;"><img src="深入剖析 linux GCC 4.4 的 STL string_files/Image.png" type="image/png" alt="" height="282" style="max-width:770px;height:282px;vertical-align:middle;border-top-color:rgb(0, 136, 204);border-bottom-color:rgb(0, 136, 204);" width="300"/></a></p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">4. 深入string内部源码</h1>
+<h2 style="font-size:31.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">4.1. string copy与strncpy</h2>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">长期以来，经常看到有人对std::string赋值拷贝与strncpy之间的效率进行比较和讨论。下面我们通过测试用例来进行一个基本的测试：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">#include&lt;iostream&gt;
+#include&lt;cstdlib&gt;
+#include&lt;string&gt;
+#include&lt;ctime&gt;
+#include&lt;cstring&gt;
+
+using namespace std;
+
+const int array_size = 200;
+const int loop_count = 1000000;
+
+void test_strncpy ()
+{
+    char s1[array_size ];
+    char* s2= new char[ array_size];
+    memset( s2, 'c' , array_size);
+    size_t start=clock ();
+    for( int i =0;i!= loop_count;++i ) strncpy( s1,s2 , array_size);
+    cout&lt;&lt; __func__ &lt;&lt; &quot; : &quot; &lt;&lt; clock()- start&lt;&lt;endl ;
+    delete s2;
+    s2 = NULL;
+}
+
+void test_string_copy ()
+{
+    string s1;
+    string s2;
+    s2. append(array_size , 'c');
+    size_t start=clock ();
+    for( int i =0;i!= loop_count;++i ) s1= s2;
+    cout&lt;&lt; __func__ &lt;&lt; &quot; : &quot; &lt;&lt; clock()- start&lt;&lt;endl ;
+}
+
+int main ()
+{
+    test_strncpy();
+    test_string_copy();
+    return 0;
+}</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">使用g++ -O3编译，运行时间如下：</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">test_strncpy : 40000<div></div>
+test_string_copy : 10000</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">字符串strncpy的运行时间居然是string copy的4倍。究其原因就是因为，string copy是基于引用计数技术，每次copy的代价非常小。<div></div>
+测试中我们还发现，如果array_size在10个字节以内的话，两者相差不大，随着array_size的变大，两者的差距也越来越大。例如，在array_size=1000的时候，strncpy就要慢13倍。</p>
+<h2 style="font-size:31.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">4.2. 通过GDB调试查看引用计数变化</h2>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上面的测试结论非常好，打消了大家对string性能问题的担忧。下面我们通过一段程序来验证引用计数在这一过程中的变化和作用。<div></div>
+请先看一段测试代码：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">#include &lt;assert.h&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+
+using namespace std;
+
+int main ()
+{
+    string a = &quot;0123456789abcdef&quot; ;
+    string b = a ;
+    cout &lt;&lt; &quot;a.data() =&quot; &lt;&lt; (void *)a. data() &lt;&lt; endl ;
+    cout &lt;&lt; &quot;b.data() =&quot; &lt;&lt; (void *)b. data() &lt;&lt; endl ;
+    assert( a.data () == b. data());
+    cout &lt;&lt; endl;
+
+    string c = a ;
+    cout &lt;&lt; &quot;a.data() =&quot; &lt;&lt; (void *)a. data() &lt;&lt; endl ;
+    cout &lt;&lt; &quot;b.data() =&quot; &lt;&lt; (void *)b. data() &lt;&lt; endl ;
+    cout &lt;&lt; &quot;c.data() =&quot; &lt;&lt; (void *)c. data() &lt;&lt; endl ;
+    assert( a.data () == c. data());
+
+    cout &lt;&lt; endl;
+    c[0] = '1';
+    cout &lt;&lt; &quot;after write:\n&quot;;
+    cout &lt;&lt; &quot;a.data() =&quot; &lt;&lt; (void *)a. data() &lt;&lt; endl ;
+    cout &lt;&lt; &quot;b.data() =&quot; &lt;&lt; (void *)b. data() &lt;&lt; endl ;
+    cout &lt;&lt; &quot;c.data() =&quot; &lt;&lt; (void *)c. data() &lt;&lt; endl ;
+    assert( a.data () != c. data() &amp;&amp; a .data() == b.data ());
+    return 0;
+}</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">运行之后，输出：</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">a.data() =0xc22028<div></div>
+b.data() =0xc22028</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">a.data() =0xc22028<div></div>
+b.data() =0xc22028<div></div>
+c.data() =0xc22028</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">after write:<div></div>
+a.data() =0xc22028<div></div>
+b.data() =0xc22028<div></div>
+c.data() =<strong><span style="color:rgb(255, 0, 0);">0xc22068</span></strong></p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上述代码运行的结果输出反应出，在我们对b、c赋值之后，a、b、c三个string对象的内部数据的内存地址都是一样的。只有当我们对c对象进行修改之后，c对象的内部数据的内存地址才不一样，这一点是是如何做到的呢？</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">我们通过gdb调试来验证引用计数在上述代码执行过程中的变化：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) b 10
+Breakpoint 1 at 0x400c35: file string_copy1.cc, line 10.
+(gdb) b 16
+Breakpoint 2 at 0x400d24: file string_copy1.cc, line 16.
+(gdb) b 23
+Breakpoint 3 at 0x400e55: file string_copy1.cc, line 23.
+(gdb) r
+Starting program: [...]/unixstudycode/string_copy/string_copy1
+[Thread debugging using libthread_db enabled]
+
+Breakpoint 1, main () at string_copy1.cc:10
+10          string b = a;
+
+(gdb) x/16ub a._M_dataplus._M_p-8       
+0x602020:       0       0       0       0       0       0       0       0
+0x602028:       48      49      50      51      52      53      54      55</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><strong><span style="color:rgb(255, 0, 0);">此时对象a的引用计数是0</span></strong></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) n                                 
+11          cout &amp;lt;&amp;lt; &quot;a.data() =&quot; &amp;lt;&amp;lt; (void*)a.data() &amp;lt;&amp;lt; endl;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>b=a 将a赋值给b，string copy</strong></span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) x/16ub a._M_dataplus._M_p-8
+0x602020:       1       0       0       0       0       0       0       0
+0x602028:       48      49      50      51      52      53      54      55</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>此时对象a的引用计数变为1，表明有另一个对象共享该对象a</strong></span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) c
+Continuing.
+a.data() =0x602028
+b.data() =0x602028
+
+Breakpoint 2, main () at string_copy1.cc:16
+16          string c = a;
+(gdb) x/16ub a._M_dataplus._M_p-8
+0x602020:       1       0       0       0       0       0       0       0
+0x602028:       48      49      50      51      52      53      54      55
+(gdb) n
+17          cout &amp;lt;&amp;lt; &quot;a.data() =&quot; &amp;lt;&amp;lt; (void*)a.data() &amp;lt;&amp;lt; endl;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>c=a 将a赋值给c，string copy</strong></span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) x/16ub a._M_dataplus._M_p-8
+0x602020:       2       0       0       0       0       0       0       0
+0x602028:       48      49      50      51      52      53      54      55</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>此时对象a的引用计数变为2，表明有另外2个对象共享该对象a</strong></span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) c
+Continuing.
+a.data() =0x602028
+b.data() =0x602028
+c.data() =0x602028
+
+Breakpoint 3, main () at string_copy1.cc:23
+23          c[0] = '1';
+(gdb) n
+24          cout &amp;lt;&amp;lt; &quot;after write:\n&quot;;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>对c的值进行修改</strong></span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) x/16ub a._M_dataplus._M_p-8
+0x602020:       1       0       0       0       0       0       0       0
+0x602028:       48      49      50      51      52      53      54      55</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>此时对象a的引用计数变为1</strong></span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">(gdb) p a._M_dataplus._M_p       
+$3 = 0x602028 &quot;0123456789abcdef&quot;
+(gdb) p b._M_dataplus._M_p
+$4 = 0x602028 &quot;0123456789abcdef&quot;
+(gdb) p c._M_dataplus._M_p
+$5 = 0x602068 &quot;1123456789abcdef&quot;</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><span style="color:rgb(255, 0, 0);"><strong>此时对象c的内部数据内存地址已经与a、b不同了，即Copy-On-Write</strong></span></p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上述GDB调试过程，清晰的验证了3个string对象a b c的通过引用计数技术联系在一起。</p>
+<h2 style="font-size:31.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">4.3. 源码分析string copy</h2>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">下面我们阅读源码来分析。上述过程。<div></div>
+先看string copy过程的源码：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">//拷贝构造函数
+basic_string(const basic_string&amp; __str)
+: _M_dataplus( __str._M_rep ()-&gt;_M_grab( _Alloc(__str .get_allocator()),
+              __str.get_allocator ()),
+              __str.get_allocator ())
+{}
+
+_CharT* _M_grab(const _Alloc&amp; __alloc1, const _Alloc&amp; __alloc2)
+{
+    return (! _M_is_leaked() &amp;&amp; __alloc1 == __alloc2)
+        ? _M_refcopy() : _M_clone (__alloc1);
+}
+
+_CharT*_M_refcopy() throw ()
+{
+#ifndef _GLIBCXX_FULLY_DYNAMIC_STRING
+    if ( __builtin_expect(this != &amp;_S_empty_rep(), false))
+#endif
+        __gnu_cxx::__atomic_add_dispatch (&amp;this-&gt; _M_refcount, 1);
+    return _M_refdata();
+}</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上面几段源代码比较好理解，先后调用了basic_string (const basic_string&amp; __str )拷贝构造函数、_M_grab、_M_refcopy，<div></div>
+_M_refcopy实际上就是调用原子操作__atomic_add_dispatch (确保线程安全)将引用计数+1，然后返回原对象的数据地址。<div></div>
+由此可以看到，string对象之间的拷贝/赋值代价非常非常小。</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">几个赋值语句之后，a、b、c对象的内存空间布局如下图所示：</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"><a href="http://blogs.360.cn/360cloud/files/2012/11/string-2.png" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;display:block;padding-top:4px;padding-bottom:4px;line-height:20px;border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgb(221, 221, 221);border-bottom-color:rgb(221, 221, 221);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;box-shadow:rgba(0, 0, 0, 0.055) 0px 1px 3px 0px;transition-duration:0.2s;transition-timing-function:ease-in-out;box-sizing:border-box;"><img src="深入剖析 linux GCC 4.4 的 STL string_files/Image [1].png" type="image/png" alt="" height="278" style="max-width:760px;height:278px;vertical-align:middle;border-top-color:rgb(0, 136, 204);border-bottom-color:rgb(0, 136, 204);display:block;" width="300"/></a></p>
+<h2 style="font-size:31.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">4.4. Copy-On-Write</h2>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">下面再来看”c[0] = ‘1’; “做了些什么：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">reference operator []( size_type __pos )
+{
+    _M_leak();
+    return _M_data ()[__pos ];
+}
+
+void _M_leak ()    // for use in begin() &amp; non-const op[]
+{
+    //前面看到 c 对象在此时实际上与a对象的数据实际上指向同一块内存区域
+    //因此会调用 _M_leak_hard()
+    if (! _M_rep ()-&gt;_M_is_leaked ())
+        _M_leak_hard ();
+}
+
+void _M_leak_hard ()
+{
+    if ( _M_rep ()-&gt;_M_is_shared ())
+        _M_mutate (0, 0, 0);
+    _M_rep()-&gt; _M_set_leaked ();
+}
+
+void _M_mutate ( size_type __pos , size_type __len1, size_type __len2 )
+{
+    const size_type __old_size = this-&gt; size ();//16
+    const size_type __new_size = __old_size + __len2 - __len1 ; //16
+    const size_type __how_much = __old_size - __pos - __len1 ; //16
+
+    if ( __new_size &gt; this -&gt; capacity() || _M_rep ()-&gt;_M_is_shared ())
+    {
+        // 重新构造一个对象
+        const allocator_type __a = get_allocator ();
+        _Rep * __r = _Rep:: _S_create (__new_size , this-&gt; capacity (), __a );
+
+        // 然后拷贝数据
+        if (__pos )
+            _M_copy (__r -&gt; _M_refdata(), _M_data (), __pos );
+        if (__how_much )
+            _M_copy (__r -&gt; _M_refdata() + __pos + __len2 ,
+            _M_data () + __pos + __len1, __how_much );
+
+        //将原对象上的引用计数减
+        _M_rep ()-&gt;_M_dispose ( __a);
+
+        //绑定到新的对象上
+        _M_data (__r -&gt; _M_refdata());
+    }
+    else if (__how_much &amp;&amp; __len1 != __len2 )
+    {
+        // Work in-place.
+        _M_move (_M_data () + __pos + __len2 ,
+            _M_data () + __pos + __len1, __how_much );
+    }
+
+    //最后设置新对象的长度和引用计数值
+    _M_rep()-&gt; _M_set_length_and_sharable (__new_size );
+}</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上面源码稍微复杂点，对c进行修改的过程分为以下两步：</p>
+<ol style="margin-block-start:;margin-block-end:;padding-inline-start:;margin-top:0px;margin-bottom:10px;">
+<li style="line-height:20px;">第一步是判断是否为共享对象，(引用计数大于0)，如果是共享对象，就拷贝一份新的数据，同时将老数据的引用计数值减1。</li>
+<li style="line-height:20px;">第二步：在新的地址空间上进行修改，从而避免了对其他对象的数据污染</li>
+</ol>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">由此可以看出，如果不是通过string提供的接口对string对象强制修改的话，会带来潜在的不安全性和破坏性。例如：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">char* p = const_cast&lt;char*&gt;(s1.data());
+p[0] = 'a';</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">上述代码对c修改(“c[0] = ‘1’; “)之后，a b c对象的内存空间布局如下：<div></div>
+<a href="http://blogs.360.cn/360cloud/files/2012/11/string-3.png" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;display:block;padding-top:4px;padding-bottom:4px;line-height:20px;border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgb(221, 221, 221);border-bottom-color:rgb(221, 221, 221);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;box-shadow:rgba(0, 0, 0, 0.055) 0px 1px 3px 0px;transition-duration:0.2s;transition-timing-function:ease-in-out;box-sizing:border-box;"><img src="深入剖析 linux GCC 4.4 的 STL string_files/Image [2].png" type="image/png" alt="" height="300" style="max-width:760px;height:300px;vertical-align:middle;border-top-color:rgb(0, 136, 204);border-bottom-color:rgb(0, 136, 204);display:block;" width="298"/></a></p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">Copy-On-Write的好处通过上文的解析是显而易见是，但也带来一些副作用。例如上述代码片段”c[0] = ‘1’; “如果是通过外部的强制操作可能会带来意想不到的结果。请看下面代码：</p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">char* pc = const_cast(c.c_str());
+pc[0] = '1';</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">这段代码通过强制修改c对象内部数据的值，看似效率上比operator[] 高，但同时也修改a、b对象的值，而这可能不是我们所希望看到的。这是我们需要提高警惕的地方。</p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;text-indent:-28.3333px;"><span lang="EN-US">5.<span style="font-size:9.33333px;line-height:13px;font-family:&quot;Times New Roman&quot;;">   </span></span><span style="font-family:宋体;">不宜使用</span><span lang="EN-US">string</span><span style="font-family:宋体;">的例子</span><span lang="EN-US">  </span></h1>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;text-indent:28px;"><span style="font-family:宋体;">我们项目组内部有一个分布式的内存</span><span lang="EN-US">kv</span><span style="font-family:宋体;">系统，一般是</span><span lang="EN-US">md5</span><span style="font-family:宋体;">做</span><span lang="EN-US">key</span><span style="font-family:宋体;">，</span><span lang="EN-US">value</span><span style="font-family:宋体;">是任意二进制数。当初设计的时候，考虑到内存容量始终有限，没有选择使用</span><span lang="EN-US">string</span><span style="font-family:宋体;">，而是单独开发的</span><span lang="EN-US">key</span><span style="font-family:宋体;">结构和</span><span lang="EN-US">value</span><span style="font-family:宋体;">结构。下面是我们设计的</span><span lang="EN-US">key</span><span style="font-family:宋体;">结构定义：</span></p>
+<pre style="font-family:Monaco,Menlo,Consolas,&quot;Courier New&quot;,monospace;white-space:pre-wrap;margin-block-start:;margin-block-end:;padding-top:9.5px;padding-bottom:9.5px;font-size:13px;color:rgb(51, 51, 51);border-top-left-radius:4px;border-top-right-radius:4px;border-bottom-right-radius:4px;border-bottom-left-radius:4px;margin-top:0px;margin-bottom:10px;word-break:break-all;word-wrap:break-word;background-color:rgb(245, 245, 245);border-top-width:1px;border-bottom-width:1px;border-top-style:solid;border-bottom-style:solid;border-top-color:rgba(0, 0, 0, 0.15);border-bottom-color:rgba(0, 0, 0, 0.15);">struct Key
+{
+    uint64_t low;
+    uint64_t high;
+};</pre>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;text-indent:28px;"><span style="font-family:宋体;">该结构所需内存大小为</span><span lang="EN-US" style="font-family:Consolas;">16</span><span style="font-family:宋体;">字节，保持二进制的</span><span lang="EN-US" style="font-family:Consolas;">16</span><span style="font-family:宋体;">字节</span><span lang="EN-US" style="font-family:Consolas;">MD5</span><span style="font-family:宋体;">。相对于</span><span lang="EN-US" style="font-family:Consolas;">string</span><span style="font-family:宋体;">做</span><span lang="EN-US" style="font-family:Consolas;">key</span><span style="font-family:宋体;">来说，要节省</span><span lang="EN-US" style="font-family:Consolas;">33(</span><span style="font-family:宋体;">参考上文</span><span lang="EN-US" style="font-family:Consolas;">string</span><span style="font-family:宋体;">内存空间布局</span><span lang="EN-US" style="font-family:Consolas;">)</span><span style="font-family:宋体;">个字节。例如，现在我们某个项目正在使用该系统的搭建的一个分布式集群，总共有</span><span lang="EN-US" style="font-family:Consolas;">100</span><span style="font-family:宋体;">亿条记录，每条记录都节省</span><span lang="EN-US" style="font-family:Consolas;">33</span><span style="font-family:宋体;">字节，总共节省内存空间：</span><span lang="EN-US" style="font-family:Consolas;">33*100</span><span style="font-family:宋体;">亿</span><span lang="EN-US" style="font-family:Consolas;">=330G</span><span style="font-family:宋体;">。由此可见，仅仅对</span><span lang="EN-US" style="font-family:Consolas;">key</span><span style="font-family:宋体;">的一个小小改进，就能节省如此大的内存，还是非常值得。</span></p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">6. 对比微软Visual Studio提供的STL版本</h1>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;">vc6.0的string实现是基于引用计数的，但不是线程安全的。但在后续版本的vc中去掉了引用计数技术，string copy 都直接进行深度内存拷贝。<div></div>
+由于string实现上的细节不一致，导致跨平台程序的移植带来潜在的风险。这种场合下，我们需要额外注意。</p>
+<p style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;"> </p>
+<h1 style="font-size:38.5px;margin-block-start:;margin-block-end:;margin-top:10px;margin-bottom:10px;font-family:&quot;Helvetica Neue&quot;,Helvetica,Arial,sans-serif;line-height:40px;color:rgb(51, 51, 51);text-rendering:optimizelegibility;clear:both;">7. 总结</h1>
+<ol style="margin-block-start:;margin-block-end:;padding-inline-start:;margin-top:0px;margin-bottom:10px;">
+<li style="line-height:20px;">即使是一个空string对象，其所占内存空间也达到33字节，因此在内存使用要求比较严格的应用场景，例如memcached等，请慎重考虑使用string。</li>
+<li style="line-height:20px;">string由于使用引用计数和Copy-On-Write技术，相对于strcpy，string copy的性能提升非常显著。</li>
+<li style="line-height:20px;">使用引用计数后，多个string指向同一块内存区域，因此，如果强制修改一个string的内容，会影响其他string。</li>
+</ol>
+<p align="center" style="margin-block-start:;margin-block-end:;margin-top:0px;margin-bottom:10px;text-align:center;">
+</p><div style="clear:both;margin-top:5px;margin-bottom:5px;"></div><div style="float:left;">
+<div>
+	<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/null" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="分享到QQ空间"><span style="text-align:left;overflow-x:hidden;overflow-y:hidden;display:block;height:32px;line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/jiathis_ico_32x32.png&quot;);background-repeat:no-repeat;background-position:0px -32px;cursor:pointer;float:left;font-size:22px;text-decoration-color:rgb(0, 136, 204);"></span></a>
+	<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/null" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="分享到微博"><span style="text-align:left;overflow-x:hidden;overflow-y:hidden;display:block;height:32px;line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/jiathis_ico_32x32.png&quot;);background-repeat:no-repeat;background-position:0px 0px;cursor:pointer;float:left;font-size:22px;text-decoration-color:rgb(0, 136, 204);"></span></a>
+	<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/null" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="分享到腾讯微博"><span style="text-align:left;overflow-x:hidden;overflow-y:hidden;display:block;height:32px;line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/jiathis_ico_32x32.png&quot;);background-repeat:no-repeat;background-position:0px -1760px;cursor:pointer;float:left;font-size:22px;text-decoration-color:rgb(0, 136, 204);"></span></a>
+	<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/null" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="分享到人人网"><span style="text-align:left;overflow-x:hidden;overflow-y:hidden;display:block;height:32px;line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/jiathis_ico_32x32.png&quot;);background-repeat:no-repeat;background-position:0px -64px;cursor:pointer;float:left;font-size:22px;text-decoration-color:rgb(0, 136, 204);"></span></a>
+	<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/null" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;" title="分享到开心网"><span style="text-align:left;overflow-x:hidden;overflow-y:hidden;display:block;height:32px;line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/jiathis_ico_32x32.png&quot;);background-repeat:no-repeat;background-position:0px -192px;cursor:pointer;float:left;font-size:22px;text-decoration-color:rgb(0, 136, 204);"></span></a>
+	<a href="http://www.jiathis.com/share/" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;text-align:left;overflow-x:hidden;overflow-y:hidden;display:block;height:32px;line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/jiathis_ico_32x32.png&quot;);background-repeat:no-repeat;background-position:0px -2048px;float:left;font-size:22px;" target="_blank"></a>
+	<a href="http://blogs.360.cn/360cloud/2012/11/26/linux-gcc-stl-string-in-depth/null" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;"><span style="float:left;font-weight:700;color:rgb(86, 86, 86);cursor:pointer;text-decoration-color:rgb(86, 86, 86);line-height:32px;background-image:url(&quot;http://v2.jiathis.com/code/images/counter.gif&quot;);background-repeat:no-repeat;background-position:0px 0px;height:32px;width:54px;font-family:arial,helvetica,sans-serif;text-align:center;display:block;" title="累计分享23次">23</span></a>
+</div>
+
+</div><div style="clear:both;margin-top:5px;margin-bottom:5px;"></div>	<span style="display:table;content:&quot;&quot;;line-height:0px;clear:both;"></span></div>
+
+	<div>
+		<span style="display:block;">Posted in <a href="http://blogs.360.cn/360cloud/category/%e5%90%8e%e5%8f%b0%e6%8a%80%e6%9c%af/" rel="category tag" style="color:rgb(0, 136, 204);text-decoration-color:rgb(0, 136, 204);text-decoration-line:none;">后台技术</a>.</span>	</div>
+	
+	</div></div></span>
+</div></body></html> 
