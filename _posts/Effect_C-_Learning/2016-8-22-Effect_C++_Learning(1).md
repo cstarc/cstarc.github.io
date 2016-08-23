@@ -1,7 +1,7 @@
 ---
 layout: post
 title: Effect_C++_Learning 1
-category: Effect_C++_Learning
+category: Learning
 tags: c++, effect
 keywords: c++, effect
 description: item 1 and 2.
