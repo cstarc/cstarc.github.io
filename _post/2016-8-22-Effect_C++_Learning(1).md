@@ -1,3 +1,12 @@
+---
+layout: post
+title: Effect_C++_Learning 1
+category: Effect_C++_Learning
+tags: c++, effect
+keywords: c++, effect
+description: item 1 and 2.
+---
+
 ## *条款1 视c++为一个语言联邦*
 随着C++的逐渐成熟，开始接受不同于C With Class的各种观念，特性和编程战略。
 > 今天的C++已经是个多重泛型编程语言，一个同时支持过程形式,面向对象形式，函数形式，泛型形式，元编程形式的语言。
